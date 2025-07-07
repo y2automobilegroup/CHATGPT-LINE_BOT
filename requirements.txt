@@ -1,5 +1,5 @@
 flask
-line-bot-sdk==3.17.1
+line-bot-sdk>=3.0.0
 openai
 pinecone-client
 supabase
