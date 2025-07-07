@@ -1,63 +1,84 @@
 import os
+import json
 from flask import Flask, request, abort
 from dotenv import load_dotenv
 from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, ReplyMessageRequest, TextMessage
-from linebot.v3.webhook import WebhookParser
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from linebot.v3.webhooks import WebhookParser, MessageEvent, TextMessageContent
 from supabase import create_client
 import openai
 
-# 載入 .env
+# --- 1. 環境變數載入 ---
 load_dotenv()
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
-# ChatGPT 系統角色
-SYSTEM_PROMPT = """
-你是亞鈺汽車智慧助理，負責解答用戶關於車輛與公司資訊的任何問題。
-你是亞鈺汽車的50年資深客服專員，擅長解決問題且擅長思考拆解問題，請先透過參考資料判斷並解析問題點，只詢問參考資料需要的問題，不要問不相關參考資料的問題，如果詢問內容不在參考資料內，請先判斷這句話是什麼類型的問題，然後針對參考資料內的資料做反問問題，最後問到需要的答案，請用最積極與充滿溫度的方式回答，若參考資料與問題無關，比如他是來聊天的，請回覆罐頭訊息："感謝您的詢問，請詢問亞鈺汽車相關問題，我們很高興為您服務！😄"，整體字數不要超過250個字，請針對問題直接回答答案
-請依下列流程處理：
-1. 問題拆解：辨識用戶意圖與關鍵字（如品牌、年份、問題類型）。
-2. 資料查詢：
-   2.1 先以語意搜尋 Supabase 的 cars 表（欄位 text）。
-   2.2 若未找到足夠資訊，再查詢 company 表。
-3. 結果評估：若找到結果，整理最相關回答；若仍不足，進入第 4 步。
-4. 追問：向用戶提出 1 個具體問題，以釐清或補充必要細節，避免一次詢問過多。
-回答務必親切、精確，並盡量附帶具體數據或範例。
-"""
+# --- 2. 欄位定義 ---
+FIELD_LIST = [
+    "物件編號", "廠牌", "車款", "車型", "年式", "年份", "變速系統", "車門數", "驅動方式", "引擎燃料", "乘客數",
+    "排氣量", "顏色", "安全性配備", "舒適性配備", "首次領牌時間", "行駛里程", "車身號碼", "引擎號碼",
+    "外匯車資料", "車輛售價", "車輛賣點", "車輛副標題", "賣家保證", "特色說明", "影片看車", "物件圖片",
+    "聯絡人", "行動電話", "賞車地址", "line", "檢測機構", "查定編號", "認證書"
+]
 
-# 初始化 Flask
+# --- 3. 初始化 ---
 app = Flask(__name__)
+config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
+line_bot_api = MessagingApi(ApiClient(config))
+parser = WebhookParser(LINE_CHANNEL_SECRET)
+openai.api_key = OPENAI_API_KEY
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# 初始化 LINE Messaging API (v3)
-config = Configuration(access_token=os.getenv("LINE_CHANNEL_ACCESS_TOKEN"))
-messaging_api = MessagingApi(ApiClient(config))
-parser = WebhookParser(os.getenv("LINE_CHANNEL_SECRET"))
+# --- 4. GPT 問題判斷 ---
+def gpt_parse_question(user_text):
+    field_str = "、".join(FIELD_LIST)
+    prompt = f"""
+你有以下欄位可查詢：
+{field_str}
 
-# OpenAI Key
-openai.api_key = os.getenv("OPENAI_API_KEY")
+請將「{user_text}」這句話，判斷：
+1. 用戶想查詢的欄位 field（只選一個最適合的，從上面欄位挑）
+2. 資料查詢關鍵詞 keyword（通常是品牌、型號、年份等）
 
-# Supabase 初始化
-supabase_url = os.getenv("SUPABASE_URL")
-supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-supabase = create_client(supabase_url, supabase_key)
+用這個格式回傳：
+{{"field": "欄位名稱", "keyword": "主要關鍵詞"}}
 
-# 查詢 Supabase
-def query_supabase(question: str) -> str:
-    cars = supabase.table("cars").select("*").ilike("text", f"%{question}%").limit(3).execute()
+如果是問價格，請 field 填「車輛售價」；如果問聯絡人，就填「聯絡人」；依此類推。
+    """
+    completion = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "system", "content": prompt}]
+    )
+    ans = completion.choices[0].message.content.strip()
+    try:
+        return json.loads(ans)
+    except Exception:
+        # 萬一GPT回傳格式不對
+        return {"field": "", "keyword": ""}
+
+# --- 5. 查Supabase欄位 ---
+def query_supabase_by_field(field: str, keyword: str) -> str:
+    if not field or not keyword:
+        return ""
+    # 避免SQL Injection，只查固定欄位
+    if field not in FIELD_LIST:
+        return ""
+    cars = supabase.table("cars").select("*").ilike(field, f"%{keyword}%").limit(1).execute()
     if cars.data:
-        first = cars.data[0]
-        return f"車輛資訊：{first.get('text', '')}"
+        value = cars.data[0].get(field, "")
+        if value:
+            return f"{field}：{value}"
+    return f"很抱歉，找不到符合『{keyword}』的{field}資料。"
 
-    company = supabase.table("company").select("*").ilike("text", f"%{question}%").limit(1).execute()
-    if company.data:
-        return f"公司資訊：{company.data[0].get('text', '')}"
-
-    return ""  # 無結果
-
-# GPT 補充回答
+# --- 6. GPT補充 ---
+SYSTEM_PROMPT = """
+你是亞鈺汽車智慧助理，負責解答用戶關於車輛與公司資訊的任何問題。請直接針對問題給出精確、有溫度、字數不超過250字的回應。
+如果無法回答，請回：「感謝您的詢問，請詢問亞鈺汽車相關問題，我們很高興為您服務！😄」
+"""
 def ask_gpt(user_text: str, context: str = "") -> str:
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT}
-    ]
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     if context:
         messages.append({"role": "assistant", "content": context})
     messages.append({"role": "user", "content": user_text})
@@ -68,7 +89,7 @@ def ask_gpt(user_text: str, context: str = "") -> str:
     )
     return completion.choices[0].message.content.strip()
 
-# LINE Webhook
+# --- 7. LINE Webhook ---
 @app.route("/api/webhook", methods=["POST"])
 def callback():
     signature = request.headers.get("x-line-signature")
@@ -84,15 +105,26 @@ def callback():
         if isinstance(event, MessageEvent) and isinstance(event.message, TextMessageContent):
             user_text = event.message.text.strip()
 
-            # 先查 Supabase
-            reply_text = query_supabase(user_text)
+            # 1️⃣ 先讓GPT判斷
+            try:
+                parse_result = gpt_parse_question(user_text)
+                field = parse_result.get('field', "")
+                keyword = parse_result.get('keyword', "")
+            except Exception as e:
+                field = ""
+                keyword = ""
+                print(f"GPT解析失敗：{e}")
 
-            # 無結果時交給 GPT
-            if not reply_text:
+            # 2️⃣ 查Supabase
+            reply_text = ""
+            if field and keyword:
+                reply_text = query_supabase_by_field(field, keyword)
+
+            # 3️⃣ 沒查到再問GPT
+            if not reply_text or "找不到" in reply_text:
                 reply_text = ask_gpt(user_text)
 
-            # v3 回覆
-            messaging_api.reply_message(
+            line_bot_api.reply_message(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
                     messages=[TextMessage(text=reply_text)]
@@ -100,6 +132,6 @@ def callback():
             )
     return "OK"
 
-# 本地測試用
+# --- 8. 本地測試用 ---
 if __name__ == "__main__":
     app.run(port=3000)
