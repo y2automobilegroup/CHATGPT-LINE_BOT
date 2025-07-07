@@ -4,8 +4,12 @@ url = "https://pypi.org/simple"
 verify_ssl = true
 
 [packages]
-
-[dev-packages]
+flask = "*"
+line-bot-sdk = "3.*"
+openai = "*"
+pinecone-client = "*"
+supabase = "*"
+python-dotenv = "*"
 
 [requires]
 python_version = "3.12"
