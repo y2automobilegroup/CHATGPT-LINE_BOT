@@ -1,6 +1,5 @@
-aiohttp==3.9.3
 Flask==3.0.2
-line-bot-sdk==3.5.0
+line-bot-sdk==3.9.0      # 已支援 Python 3.11/3.12
 openai==1.23.0
 supabase==1.0.3
 python-dotenv==1.0.1
