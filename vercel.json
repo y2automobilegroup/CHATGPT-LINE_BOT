@@ -1,10 +1,8 @@
 {
-  "version": 2,
-  // 只用 builds 而不額外指定 functions
-  "builds": [
+  "routes": [
     {
-      "src": "api/**/*.py",
-      "use": "@vercel/python@1.9.0"
+      "src": "/webhook",
+      "dest": "/api/webhook.js"
     }
   ]
 }
