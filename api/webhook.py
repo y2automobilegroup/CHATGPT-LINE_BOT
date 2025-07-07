@@ -1,7 +1,7 @@
 import os
 from flask import Flask, request, abort
 from dotenv import load_dotenv
-from linebot import LineBotApi, WebhookParser
+from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, ReplyMessageRequest, TextMessage
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from linebot.v3.messaging import TextMessage
 from supabase import create_client
