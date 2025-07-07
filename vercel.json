@@ -1,11 +1,10 @@
 {
   "version": 2,
+  // 只用 builds 而不額外指定 functions
   "builds": [
-    { "src": "api/**/*.py", "use": "@vercel/python@1.0.0" }
-  ],
-  "functions": {
-    "api/**/*.py": {
-      "runtime": "@vercel/python@1.0.0"
+    {
+      "src": "api/**/*.py",
+      "use": "@vercel/python@1.9.0"
     }
-  }
+  ]
 }
