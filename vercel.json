@@ -4,9 +4,7 @@
       "src": "/webhook",
       "dest": "/api/webhook.js"
     }
-  ]
-}
-{
+  ],
   "functions": {
     "api/**/*.py": {
       "runtime": "python3.11"
