@@ -7,7 +7,7 @@ from linebot.v3.messaging import (
     ReplyMessageRequest, TextMessage
 )
 from linebot.v3.webhooks import (
-    WebhookParser, MessageEvent, TextMessageContent
+    WebhookHandler, MessageEvent, TextMessageContent
 )
 from supabase import create_client
 import openai
@@ -32,7 +32,7 @@ FIELD_LIST = [
 app = Flask(__name__)
 config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 line_bot_api = MessagingApi(ApiClient(config))
-parser = WebhookParser(LINE_CHANNEL_SECRET)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)   # <-- 這裡是 handler，不是 parser！
 openai.api_key = OPENAI_API_KEY
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -96,38 +96,34 @@ def callback():
     signature = request.headers.get("x-line-signature")
     body = request.get_data(as_text=True)
     try:
-        events = parser.parse(body, signature)
+        handler.handle(body, signature)
     except Exception as e:
-        print("Webhook parse error:", e)
+        print("Webhook handle error:", e)
         abort(400)
-    for event in events:
-        if isinstance(event, MessageEvent) and isinstance(event.message, TextMessageContent):
-            user_text = event.message.text.strip()
-            # 1️⃣ GPT 問題拆解
-            try:
-                parse_result = gpt_parse_question(user_text)
-                field = parse_result.get('field', "")
-                keyword = parse_result.get('keyword', "")
-            except Exception as e:
-                field = ""
-                keyword = ""
-                print(f"GPT解析失敗：{e}")
-            # 2️⃣ 查 Supabase
-            reply_text = ""
-            if field and keyword:
-                reply_text = query_supabase_by_field(field, keyword)
-            # 3️⃣ 查不到再問 GPT
-            if not reply_text or "找不到" in reply_text:
-                reply_text = ask_gpt(user_text)
-            # 回覆用戶
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text=reply_text)]
-                )
-            )
     return "OK"
 
-# --- 本地執行 ---
+@handler.add(MessageEvent, message=TextMessageContent)
+def handle_message(event):
+    user_text = event.message.text.strip()
+    try:
+        parse_result = gpt_parse_question(user_text)
+        field = parse_result.get('field', "")
+        keyword = parse_result.get('keyword', "")
+    except Exception as e:
+        field = ""
+        keyword = ""
+        print(f"GPT解析失敗：{e}")
+    reply_text = ""
+    if field and keyword:
+        reply_text = query_supabase_by_field(field, keyword)
+    if not reply_text or "找不到" in reply_text:
+        reply_text = ask_gpt(user_text)
+    line_bot_api.reply_message(
+        ReplyMessageRequest(
+            reply_token=event.reply_token,
+            messages=[TextMessage(text=reply_text)]
+        )
+    )
+
 if __name__ == "__main__":
     app.run(port=3000)
