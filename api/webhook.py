@@ -3,7 +3,7 @@ import json
 from flask import Flask, request, abort
 from dotenv import load_dotenv
 from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, ReplyMessageRequest, TextMessage
-from linebot.v3.webhooks import MessageEvent, TextMessageContent  # 只需要這個
+from linebot.v3.webhook import MessageEvent, TextMessageContent  # 只需要這個
 from supabase import create_client
 import openai
 
