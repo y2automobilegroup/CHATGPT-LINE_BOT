@@ -3,11 +3,11 @@ import json
 from flask import Flask, request, abort
 from dotenv import load_dotenv
 from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, ReplyMessageRequest, TextMessage
-from linebot.v3.webhooks import WebhookHandler, MessageEvent, TextMessageContent
+from linebot.v3.webhooks import WebhookParser, MessageEvent, TextMessageContent
 from supabase import create_client
 import openai
 
-# --- 1. 環境變數載入 ---
+# --- 1. 載入環境變數 ---
 load_dotenv()
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
@@ -27,11 +27,11 @@ FIELD_LIST = [
 app = Flask(__name__)
 config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 line_bot_api = MessagingApi(ApiClient(config))
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
+parser = WebhookParser(LINE_CHANNEL_SECRET)
 openai.api_key = OPENAI_API_KEY
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --- 4. GPT 問題判斷 ---
+# --- 4. GPT 判斷用戶查詢內容 ---
 def gpt_parse_question(user_text):
     field_str = "、".join(FIELD_LIST)
     prompt = f"""
@@ -55,13 +55,13 @@ def gpt_parse_question(user_text):
     try:
         return json.loads(ans)
     except Exception:
-        # 萬一GPT回傳格式不對
         return {"field": "", "keyword": ""}
 
-# --- 5. 查Supabase欄位 ---
+# --- 5. 查 Supabase 欄位 ---
 def query_supabase_by_field(field: str, keyword: str) -> str:
     if not field or not keyword:
         return ""
+    # 限定只查固定欄位
     if field not in FIELD_LIST:
         return ""
     cars = supabase.table("cars").select("*").ilike(field, f"%{keyword}%").limit(1).execute()
@@ -71,7 +71,7 @@ def query_supabase_by_field(field: str, keyword: str) -> str:
             return f"{field}：{value}"
     return f"很抱歉，找不到符合『{keyword}』的{field}資料。"
 
-# --- 6. GPT補充 ---
+# --- 6. GPT 補充 ---
 SYSTEM_PROMPT = """
 你是亞鈺汽車智慧助理，負責解答用戶關於車輛與公司資訊的任何問題。請直接針對問題給出精確、有溫度、字數不超過250字的回應。
 如果無法回答，請回：「感謝您的詢問，請詢問亞鈺汽車相關問題，我們很高興為您服務！😄」
@@ -93,42 +93,43 @@ def ask_gpt(user_text: str, context: str = "") -> str:
 def callback():
     signature = request.headers.get("x-line-signature")
     body = request.get_data(as_text=True)
+
     try:
-        handler.handle(body, signature)
+        events = parser.parse(body, signature)
     except Exception as e:
-        print("Webhook handle error:", e)
+        print("Webhook parse error:", e)
         abort(400)
+
+    for event in events:
+        if isinstance(event, MessageEvent) and isinstance(event.message, TextMessageContent):
+            user_text = event.message.text.strip()
+
+            # 1️⃣ 先讓GPT判斷問題屬性
+            try:
+                parse_result = gpt_parse_question(user_text)
+                field = parse_result.get('field', "")
+                keyword = parse_result.get('keyword', "")
+            except Exception as e:
+                field = ""
+                keyword = ""
+                print(f"GPT解析失敗：{e}")
+
+            # 2️⃣ 查Supabase
+            reply_text = ""
+            if field and keyword:
+                reply_text = query_supabase_by_field(field, keyword)
+
+            # 3️⃣ 沒查到再問GPT
+            if not reply_text or "找不到" in reply_text:
+                reply_text = ask_gpt(user_text)
+
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_text)]
+                )
+            )
     return "OK"
-
-@handler.add(MessageEvent, message=TextMessageContent)
-def handle_message(event):
-    user_text = event.message.text.strip()
-    # 1️⃣ 先讓GPT判斷
-    try:
-        parse_result = gpt_parse_question(user_text)
-        field = parse_result.get('field', "")
-        keyword = parse_result.get('keyword', "")
-    except Exception as e:
-        field = ""
-        keyword = ""
-        print(f"GPT解析失敗：{e}")
-
-    # 2️⃣ 查Supabase
-    reply_text = ""
-    if field and keyword:
-        reply_text = query_supabase_by_field(field, keyword)
-
-    # 3️⃣ 沒查到再問GPT
-    if not reply_text or "找不到" in reply_text:
-        reply_text = ask_gpt(user_text)
-
-    # 回覆
-    line_bot_api.reply_message(
-        ReplyMessageRequest(
-            reply_token=event.reply_token,
-            messages=[TextMessage(text=reply_text)]
-        )
-    )
 
 # --- 8. 本地測試用 ---
 if __name__ == "__main__":
