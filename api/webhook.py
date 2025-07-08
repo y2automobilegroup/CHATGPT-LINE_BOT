@@ -1,16 +1,23 @@
 import os
 import json
-import hmac
-import hashlib
-import base64
 from flask import Flask, request, abort
 from dotenv import load_dotenv
-from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, ReplyMessageRequest, TextMessage
-from linebot.v3.webhooks import MessageEvent
+from linebot.v3.messaging import (
+    Configuration,
+    ApiClient,
+    MessagingApi,
+    ReplyMessageRequest,
+    TextMessage,
+)
+from linebot.v3.webhooks import (
+    MessageEvent,
+    TextMessageContent
+)
+from linebot.v3.webhooks import WebhookParser
 from supabase import create_client
 import openai
 
-# --- 1. 環境變數載入 ---
+# --- 1. 載入環境變數 ---
 load_dotenv()
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
@@ -30,20 +37,11 @@ FIELD_LIST = [
 app = Flask(__name__)
 config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 line_bot_api = MessagingApi(ApiClient(config))
+parser = WebhookParser(LINE_CHANNEL_SECRET)
 openai.api_key = OPENAI_API_KEY
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --- 4. 驗證 LINE 簽章 ---
-def validate_signature(body, signature, channel_secret):
-    hash = hmac.new(
-        channel_secret.encode('utf-8'),
-        body.encode('utf-8'),
-        hashlib.sha256
-    ).digest()
-    expected_signature = base64.b64encode(hash).decode('utf-8')
-    return hmac.compare_digest(expected_signature, signature)
-
-# --- 5. GPT 問題判斷 ---
+# --- 4. GPT 問題欄位判斷 ---
 def gpt_parse_question(user_text):
     field_str = "、".join(FIELD_LIST)
     prompt = f"""
@@ -69,7 +67,7 @@ def gpt_parse_question(user_text):
     except Exception:
         return {"field": "", "keyword": ""}
 
-# --- 6. 查Supabase欄位 ---
+# --- 5. 查 Supabase 欄位 ---
 def query_supabase_by_field(field: str, keyword: str) -> str:
     if not field or not keyword:
         return ""
@@ -82,7 +80,7 @@ def query_supabase_by_field(field: str, keyword: str) -> str:
             return f"{field}：{value}"
     return f"很抱歉，找不到符合『{keyword}』的{field}資料。"
 
-# --- 7. GPT補充 ---
+# --- 6. GPT 補充 ---
 SYSTEM_PROMPT = """
 你是亞鈺汽車智慧助理，負責解答用戶關於車輛與公司資訊的任何問題。請直接針對問題給出精確、有溫度、字數不超過250字的回應。
 如果無法回答，請回：「感謝您的詢問，請詢問亞鈺汽車相關問題，我們很高興為您服務！😄」
@@ -99,25 +97,23 @@ def ask_gpt(user_text: str, context: str = "") -> str:
     )
     return completion.choices[0].message.content.strip()
 
-# --- 8. LINE Webhook ---
+# --- 7. LINE Webhook ---
 @app.route("/api/webhook", methods=["POST"])
 def callback():
     signature = request.headers.get("x-line-signature")
     body = request.get_data(as_text=True)
 
-    if not validate_signature(body, signature, LINE_CHANNEL_SECRET):
-        print("Signature validation failed")
+    try:
+        events = parser.parse(body, signature)
+    except Exception as e:
+        print("Webhook parse error:", e)
         abort(400)
 
-    body_json = request.get_json()
-    events = body_json.get("events", [])
-
     for event in events:
-        if event.get("type") == "message" and event.get("message", {}).get("type") == "text":
-            user_text = event["message"]["text"].strip()
-            reply_token = event["replyToken"]
+        if isinstance(event, MessageEvent) and isinstance(event.message, TextMessageContent):
+            user_text = event.message.text.strip()
 
-            # 1️⃣ 先讓GPT判斷
+            # 1. 先讓GPT判斷
             try:
                 parse_result = gpt_parse_question(user_text)
                 field = parse_result.get('field', "")
@@ -127,23 +123,24 @@ def callback():
                 keyword = ""
                 print(f"GPT解析失敗：{e}")
 
-            # 2️⃣ 查Supabase
+            # 2. 查 Supabase
             reply_text = ""
             if field and keyword:
                 reply_text = query_supabase_by_field(field, keyword)
 
-            # 3️⃣ 沒查到再問GPT
+            # 3. 沒查到再問 GPT
             if not reply_text or "找不到" in reply_text:
                 reply_text = ask_gpt(user_text)
 
+            # 4. 回覆用戶
             line_bot_api.reply_message(
                 ReplyMessageRequest(
-                    reply_token=reply_token,
+                    reply_token=event.reply_token,
                     messages=[TextMessage(text=reply_text)]
                 )
             )
     return "OK"
 
-# --- 9. 本地測試用 ---
+# --- 8. 本地測試用 ---
 if __name__ == "__main__":
     app.run(port=3000)
