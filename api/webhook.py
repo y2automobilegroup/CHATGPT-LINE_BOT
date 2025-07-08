@@ -86,7 +86,7 @@ def ask_gpt(user_text: str, context: str = "") -> str:
     messages.append({"role": "user", "content": user_text})
     completion = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
-        messages=messages,
+        messages=messages
     )
     return completion.choices[0].message.content.strip()
 
