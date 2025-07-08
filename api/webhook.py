@@ -1,16 +1,16 @@
 import os
 import json
+import hmac
+import hashlib
+import base64
 from flask import Flask, request, abort
 from dotenv import load_dotenv
-from linebot.v3.messaging import (
-    Configuration, ApiClient, MessagingApi,
-    ReplyMessageRequest, TextMessage
-)
-from linebot.v3.webhooks import validate_signature
+from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, ReplyMessageRequest, TextMessage
+from linebot.v3.webhooks import MessageEvent
 from supabase import create_client
 import openai
 
-# 1. 讀環境變數
+# --- 1. 環境變數載入 ---
 load_dotenv()
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
@@ -18,7 +18,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
-# 2. 欄位定義
+# --- 2. 欄位定義 ---
 FIELD_LIST = [
     "物件編號", "廠牌", "車款", "車型", "年式", "年份", "變速系統", "車門數", "驅動方式", "引擎燃料", "乘客數",
     "排氣量", "顏色", "安全性配備", "舒適性配備", "首次領牌時間", "行駛里程", "車身號碼", "引擎號碼",
@@ -26,14 +26,24 @@ FIELD_LIST = [
     "聯絡人", "行動電話", "賞車地址", "line", "檢測機構", "查定編號", "認證書"
 ]
 
-# 3. 初始化
+# --- 3. 初始化 ---
 app = Flask(__name__)
 config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 line_bot_api = MessagingApi(ApiClient(config))
 openai.api_key = OPENAI_API_KEY
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# 4. GPT 問題判斷
+# --- 4. 驗證 LINE 簽章 ---
+def validate_signature(body, signature, channel_secret):
+    hash = hmac.new(
+        channel_secret.encode('utf-8'),
+        body.encode('utf-8'),
+        hashlib.sha256
+    ).digest()
+    expected_signature = base64.b64encode(hash).decode('utf-8')
+    return hmac.compare_digest(expected_signature, signature)
+
+# --- 5. GPT 問題判斷 ---
 def gpt_parse_question(user_text):
     field_str = "、".join(FIELD_LIST)
     prompt = f"""
@@ -59,9 +69,11 @@ def gpt_parse_question(user_text):
     except Exception:
         return {"field": "", "keyword": ""}
 
-# 5. 查 Supabase 欄位
+# --- 6. 查Supabase欄位 ---
 def query_supabase_by_field(field: str, keyword: str) -> str:
-    if not field or not keyword or field not in FIELD_LIST:
+    if not field or not keyword:
+        return ""
+    if field not in FIELD_LIST:
         return ""
     cars = supabase.table("cars").select("*").ilike(field, f"%{keyword}%").limit(1).execute()
     if cars.data:
@@ -70,7 +82,7 @@ def query_supabase_by_field(field: str, keyword: str) -> str:
             return f"{field}：{value}"
     return f"很抱歉，找不到符合『{keyword}』的{field}資料。"
 
-# 6. GPT補充
+# --- 7. GPT補充 ---
 SYSTEM_PROMPT = """
 你是亞鈺汽車智慧助理，負責解答用戶關於車輛與公司資訊的任何問題。請直接針對問題給出精確、有溫度、字數不超過250字的回應。
 如果無法回答，請回：「感謝您的詢問，請詢問亞鈺汽車相關問題，我們很高興為您服務！😄」
@@ -80,32 +92,32 @@ def ask_gpt(user_text: str, context: str = "") -> str:
     if context:
         messages.append({"role": "assistant", "content": context})
     messages.append({"role": "user", "content": user_text})
+
     completion = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
         messages=messages,
     )
     return completion.choices[0].message.content.strip()
 
-# 7. LINE Webhook
+# --- 8. LINE Webhook ---
 @app.route("/api/webhook", methods=["POST"])
-def webhook():
+def callback():
     signature = request.headers.get("x-line-signature")
     body = request.get_data(as_text=True)
 
-    # 簽名驗證
-    try:
-        validate_signature(body, signature, LINE_CHANNEL_SECRET)
-    except Exception as e:
-        print("Signature validation failed:", e)
+    if not validate_signature(body, signature, LINE_CHANNEL_SECRET):
+        print("Signature validation failed")
         abort(400)
 
-    # 解析事件 (json)
-    events = json.loads(body).get("events", [])
+    body_json = request.get_json()
+    events = body_json.get("events", [])
+
     for event in events:
-        if event.get("type") == "message" and event["message"].get("type") == "text":
+        if event.get("type") == "message" and event.get("message", {}).get("type") == "text":
             user_text = event["message"]["text"].strip()
             reply_token = event["replyToken"]
 
+            # 1️⃣ 先讓GPT判斷
             try:
                 parse_result = gpt_parse_question(user_text)
                 field = parse_result.get('field', "")
@@ -115,9 +127,12 @@ def webhook():
                 keyword = ""
                 print(f"GPT解析失敗：{e}")
 
+            # 2️⃣ 查Supabase
             reply_text = ""
             if field and keyword:
                 reply_text = query_supabase_by_field(field, keyword)
+
+            # 3️⃣ 沒查到再問GPT
             if not reply_text or "找不到" in reply_text:
                 reply_text = ask_gpt(user_text)
 
@@ -127,9 +142,8 @@ def webhook():
                     messages=[TextMessage(text=reply_text)]
                 )
             )
-
     return "OK"
 
-# 8. 本地測試
+# --- 9. 本地測試用 ---
 if __name__ == "__main__":
     app.run(port=3000)
